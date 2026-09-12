@@ -3,6 +3,9 @@
 基于 DeepSeek 的 Python/后端面试模拟与辅导 Agent：Vue3 前端（多用户账号）+
 FastAPI 统一后端（REST + SSE + 语音 WebSocket）+ 定时爬取题库（SQLite）。
 
+> 本文件只承载 **Git/代码层** 的技术硬约定；基于 WorkBuddy 平台的团队协作流程
+> （职责边界、任务流转、资产库、成员准入）见 [docs/TEAM_COLLABORATION.md](docs/TEAM_COLLABORATION.md)。
+
 ## 常用命令
 
 ```bash
