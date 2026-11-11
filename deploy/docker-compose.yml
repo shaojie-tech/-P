@@ -2,7 +2,7 @@ services:
   app:
     build:
       context: ..
-      dockerfile: Dockerfile
+      dockerfile: deploy/Dockerfile
     ports:
       - "${HOST_PORT:-8765}:8765"
     environment:
