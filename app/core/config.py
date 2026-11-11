@@ -94,6 +94,19 @@ WEB_URL = os.getenv("WEB_URL", "http://localhost:8501").strip().rstrip("/")
 APP_HOST = os.getenv("APP_HOST", os.getenv("VOICE_HOST", "127.0.0.1")).strip()
 APP_PORT = int(os.getenv("APP_PORT", os.getenv("VOICE_PORT", "8765")))
 
+# ---- CORS 跨域白名单（逗号分隔）----
+# Web 版同源托管本不需要 CORS；安卓 APK（Capacitor WebView）的页面 origin 是
+# https://localhost（Android）/ capacitor://localhost（iOS），调用远程后端属于
+# 跨域，必须放行。部署公网后如有网页版直连需求，用环境变量追加自己的域名。
+CORS_ORIGINS = [
+    o.strip()
+    for o in os.getenv(
+        "CORS_ORIGINS",
+        "capacitor://localhost,https://localhost,http://localhost",
+    ).split(",")
+    if o.strip()
+]
+
 # ---- 登录令牌有效期（天）----
 TOKEN_TTL_DAYS = int(os.getenv("TOKEN_TTL_DAYS", "30"))
 

@@ -36,6 +36,9 @@ Thumbs.db
 build/
 dist/
 
+# 本地下载的 APK 交付物（CI 产物，不入库）
+dist-apk/
+
 # 测试与静态检查缓存
 .pytest_cache/
 .ruff_cache/

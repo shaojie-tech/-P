@@ -17,12 +17,17 @@ Bearer 令牌换取；长效令牌不出请求头，bug #23）：
     {"type":"asr_ready"/"asr_error"/"asr_text"/"asr_partial"}  ASR 事件
     {"type":"done"} / {"type":"cancelled"}
     {"type":"error","code":"rate_limit"|"internal","message":...}  结构化错误
+
+sid 在**连接内全局单调递增**（跨回复不复位）：打断后旧任务若有迟到帧，其 sid
+必然小于新回复的 first_sid，前端可据此直接丢弃，新旧音频永不混入同一缓冲。
+服务端另有 epoch 守卫（_GuardedSender）：新回复开始后旧任务的一切发送立即失效。
 """
 
 import asyncio
 import json
 import logging
 import re
+import time
 from contextlib import suppress
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
@@ -39,6 +44,11 @@ logger = logging.getLogger("interview_coach.voice_ws")
 _END = object()  # 生成器结束哨兵（StopIteration 不能跨 asyncio.to_thread 传播）
 
 router = APIRouter()
+
+#: barge-in 取消旧回复后等待其退出的宽限期（秒）。旧任务若阻塞在
+#: asyncio.to_thread(next(gen))（LLM 同步流不可中断），cancel 要等线程返回才生效；
+#: 超时后不再干等，由 epoch 守卫丢弃其迟到帧，新回复照常开始。
+CANCEL_GRACE_SECONDS = 1.0
 
 #: ASR 断线自动重连：初始延迟与最大退避（秒）。
 #: 阿里云实时识别是长连接 WebSocket，网络抖动会断开（心跳 PONG 超时），需要自动恢复
@@ -98,6 +108,42 @@ def _clear_custom_when_finished(user_id: int, session: InterviewSession) -> None
         voice_store.clear_custom_interview(user_id)
 
 
+class _StaleReply(Exception):
+    """回复任务已过期（被 barge-in 取代）：发送守卫抛出，任务据此静默终止。"""
+
+    def __init__(self, epoch: int) -> None:
+        super().__init__(f"stale reply epoch={epoch}")
+        self.epoch = epoch
+
+
+class _GuardedSender:
+    """带 epoch 守卫的发送代理（满足 tts.Sender 协议）。
+
+    打断后旧回复任务未必立刻退出：cancel 的送达有延迟，阻塞在
+    asyncio.to_thread 的 LLM 拉流线程更是无法中断。旧任务若继续向同一条
+    WebSocket 推帧，会与新回复的帧交错——浏览器把新旧音频拼进同一 sid
+    缓冲（两种声音混播）或整段解码失败（打断后不出声）。连接级 epoch 单调
+    递增，旧任务发送任何帧时一旦发现 epoch 过期立即抛 _StaleReply 终止。
+    """
+
+    def __init__(self, conn: "VoiceConnection", epoch: int) -> None:
+        self._conn = conn
+        self._epoch = epoch
+
+    @property
+    def epoch(self) -> int:
+        return self._epoch
+
+    @property
+    def expired(self) -> bool:
+        return self._conn.epoch != self._epoch
+
+    async def send_text(self, data: str) -> None:
+        if self.expired:
+            raise _StaleReply(self._epoch)
+        await self._conn.ws.send_text(data)
+
+
 class VoiceConnection:
     """一通语音通话：连接状态、会话恢复、ASR 生命周期与消息分发。"""
 
@@ -112,6 +158,12 @@ class VoiceConnection:
         self.asr_retry: asyncio.Task | None = None
         self.asr_stopping = False
         self.audio_seen = False  # 是否收到过麦克风音频帧（诊断用）
+        self._restore_kind = "new"  # 会话恢复方式（custom/resume/new，日志诊断用）
+        # 回复代号：每次开始新回复 +1，旧任务的发送守卫据此失效（barge-in 竞态防线）
+        self.epoch = 0
+        # 连接级共享 TTS 状态：sid 跨回复单调递增（新旧音频帧永不共享 sid），
+        # 熔断计数按连接累计（与 tts.py "TtsState 按连接隔离"的设计一致）
+        self.tts_state = tts.TtsState()
 
     # ---- 生命周期 ----
 
@@ -119,10 +171,13 @@ class VoiceConnection:
         """认证通过并 accept 之后的全部连接生命周期。"""
         await self._register()
         self.session, greeting = self._restore_session()
+        logger.info("语音通话接通 user_id=%s 会话恢复=%s", self.user_id, self._restore_kind)
         # 新建会话（语音发起的默认答疑 / 语音定制）落库，供文字版与后续语音共享
         if getattr(self.session, "session_id", None) is None:
             session_store.start_session(self.user_id, self.session)
-        self.generation = asyncio.create_task(_produce_greeting(self.ws, greeting))
+        self.generation = asyncio.create_task(
+            _produce_greeting(_GuardedSender(self, self.epoch), self.tts_state, greeting)
+        )
         try:
             while True:
                 msg = await self.ws.receive()
@@ -133,9 +188,9 @@ class VoiceConnection:
                 elif msg.get("bytes") is not None:
                     self._handle_audio_frame(msg["bytes"])
         except WebSocketDisconnect:
-            logger.info("语音通话已断开")
+            logger.info("语音通话已断开 user_id=%s", self.user_id)
         finally:
-            self._cleanup()
+            await self._cleanup()
 
     async def _register(self) -> None:
         """单用户互踢：先原子登记自己，再关闭同账号旧连接（bug #14）。
@@ -156,6 +211,7 @@ class VoiceConnection:
         custom = voice_store.load_custom_interview(self.user_id)
         if custom:
             # 已准备定制面试 → 接通即进入模拟面试，用定制题目
+            self._restore_kind = "custom"
             session = InterviewSession(
                 "mock",
                 questions=custom["questions"],
@@ -168,21 +224,33 @@ class VoiceConnection:
         # 该用户未结束的活跃会话 → 接着聊；否则默认辅导答疑
         session = session_store.load_active_session(self.user_id)
         if session is not None and not session.finished:
+            self._restore_kind = "resume"
             return session, REOPEN_GREETING
+        self._restore_kind = "new"
         return InterviewSession("coach", persona=self.persona, user_id=self.user_id), (
             prompts.VOICE_GREETING
         )
 
-    def _cleanup(self) -> None:
+    async def _cleanup(self) -> None:
+        """连接结束清理：取消生成/重连任务、关闭 ASR、注销互踢登记。"""
         self.asr_stopping = True
         if self.asr_retry is not None:
             self.asr_retry.cancel()
-        if self.generation is not None and not self.generation.done():
-            self.generation.cancel()
-        if self.asr is not None:
-            self.asr.stop()
+        gen = self.generation
+        if gen is not None and not gen.done():
+            gen.cancel()
+            with suppress(Exception):
+                await asyncio.wait({gen}, timeout=CANCEL_GRACE_SECONDS)
+        # asr.stop() 是同步网络操作：在事件循环里直接调会卡住整个服务，挪到线程执行
+        asr, self.asr = self.asr, None
+        if asr is not None:
+            try:
+                await asyncio.to_thread(asr.stop)
+            except Exception:
+                logger.exception("ASR 停止失败 user_id=%s", self.user_id)
         if _CONNECTIONS.get(self.user_id) is self.ws:
             _CONNECTIONS.pop(self.user_id, None)
+        logger.info("语音通话清理完成 user_id=%s", self.user_id)
 
     # ---- 消息分发 ----
 
@@ -193,7 +261,8 @@ class VoiceConnection:
             return
         mtype = msg.get("type")
         if mtype == "stop":
-            self._cancel_generation()
+            logger.info("收到 stop 帧，取消当前回复 user_id=%s epoch=%s", self.user_id, self.epoch)
+            await self._cancel_generation()
             return
         if mtype == "asr_start":
             # 前端告知采集采样率 → 创建 DashScope 流式 ASR；
@@ -259,9 +328,16 @@ class VoiceConnection:
             # 从答疑切换为模拟面试：新会话入库，替换当前会话
             self.session = session = new_session
             session_store.start_session(self.user_id, session)
-        # 用户开口 → 取消上一轮未完成的生成（barge-in）
-        self._cancel_generation()
-        task = asyncio.create_task(_produce(self.ws, session, text))
+        # 用户开口 → 取消上一轮未完成的生成（barge-in），等它真正退出（或超时）
+        await self._cancel_generation()
+        # epoch 前进：旧任务若仍卡在不可中断的 LLM 线程里，其迟到帧全部被守卫丢弃
+        self.epoch += 1
+        logger.info(
+            "开始生成回复 user_id=%s epoch=%s text_len=%s", self.user_id, self.epoch, len(text)
+        )
+        task = asyncio.create_task(
+            _produce(_GuardedSender(self, self.epoch), session, text, self.tts_state)
+        )
 
         def _on_produce_done(t, s=session):
             # 被打断（barge-in）或生成异常的任务不落库：前者的半截回复由下一轮
@@ -278,9 +354,28 @@ class VoiceConnection:
         task.add_done_callback(_on_produce_done)
         self.generation = task
 
-    def _cancel_generation(self) -> None:
-        if self.generation is not None and not self.generation.done():
-            self.generation.cancel()
+    async def _cancel_generation(self) -> None:
+        """取消当前生成任务并等待其退出（barge-in）。
+
+        必须等待：cancel 只是"请求取消"，旧任务可能还在向 WebSocket 推帧
+        （尤其是阻塞在不可中断的 LLM 拉流线程时）。等待超过宽限期则放弃干等，
+        由调用方递增 epoch，守卫会丢弃旧任务之后的一切发送。
+        """
+        task = self.generation
+        if task is None or task.done():
+            return
+        task.cancel()
+        _, pending = await asyncio.wait({task}, timeout=CANCEL_GRACE_SECONDS)
+        if pending:
+            logger.warning(
+                "旧回复任务 %.1fs 内未退出（LLM 同步流不可中断），迟到帧将由 epoch 守卫丢弃 "
+                "user_id=%s epoch=%s",
+                CANCEL_GRACE_SECONDS,
+                self.user_id,
+                self.epoch,
+            )
+        else:
+            logger.info("旧回复任务已退出（barge-in）user_id=%s", self.user_id)
 
     async def _send(self, obj: dict) -> None:
         with suppress(Exception):
@@ -297,10 +392,17 @@ class VoiceConnection:
         await self._send({"type": "asr_partial", "content": text})
 
     async def _on_asr_error(self, code=None, message=None) -> None:
-        """ASR 识别流中途出错：置 None，由监督任务自动重连（指数退避）。"""
-        self.asr = None
+        """ASR 识别流中途出错：关闭旧实例并置 None，由监督任务自动重连（指数退避）。"""
+        old, self.asr = self.asr, None
+        if old is not None:
+            # 旧实例必须 stop：否则其 WebSocket 连接与 SDK 线程泄漏，
+            # 监督任务重连又建新实例，泄漏随抖动次数累积
+            try:
+                await asyncio.to_thread(old.stop)
+            except Exception:
+                logger.exception("旧 ASR 实例关闭失败 user_id=%s", self.user_id)
         detail = f"{code}: {message}" if code else (message or "未知错误")
-        logger.warning("ASR 识别流中断: %s", detail)
+        logger.warning("ASR 识别流中断 user_id=%s: %s", self.user_id, detail)
         await self._send(
             {
                 "type": "asr_error",
@@ -367,8 +469,15 @@ async def voice(ws: WebSocket) -> None:
 # ---- 回复生成（LLM 流式 + TTS 推送）----
 
 
-async def _produce(ws: WebSocket, session: InterviewSession, text: str) -> None:
-    """把用户文本推进会话，流式生成文本+语音；任务可被取消（barge-in）。"""
+async def _produce(
+    ws: _GuardedSender, session: InterviewSession, text: str, state: tts.TtsState
+) -> None:
+    """把用户文本推进会话，流式生成文本+语音；任务可被取消（barge-in）。
+
+    ws 是 epoch 守卫发送器：本任务被新回复取代后，任何发送都会抛 _StaleReply
+    终止任务，迟到帧不再污染新回复（打断后两种声音/不出声的根因）。
+    state 是连接级共享 TTS 状态：sid 跨回复单调递增，熔断按连接累计。
+    """
     gen = session.handle_stream(text)
 
     def _next_chunk():
@@ -379,9 +488,12 @@ async def _produce(ws: WebSocket, session: InterviewSession, text: str) -> None:
 
     buf = ""  # 未切分句的流式残余
     tts_buf = ""  # 待合成的多句缓冲（合并后一次合成，减少连接数、保留句间语气）
-    state = tts.TtsState()
+    # 每次回复重置降级开关与音色锁（熔断计数 sid/fails/open_until 保持连接级）
+    state.ok = True
+    state.voice = ""
     tts_tasks: list[asyncio.Task] = []
     sem = asyncio.Semaphore(tts.TTS_MAX_CONCURRENCY)
+    started = time.monotonic()
     # 语音回合也要维护共享文字历史，否则 REST 侧 history_for_display 优先读
     # display_history 时，语音回合会从文字历史中永久缺失（bug #7）
     session.display_history.append(["user", text])
@@ -445,6 +557,13 @@ async def _produce(ws: WebSocket, session: InterviewSession, text: str) -> None:
             # 无论成功/失败/取消都让出推送权，避免卡死后续任务
             await _end_turn()
 
+    async def _drain_tts_tasks() -> None:
+        """取消并等待所有合成子任务退出，防止孤儿任务在回复结束后继续推帧。"""
+        for t in tts_tasks:
+            t.cancel()
+        if tts_tasks:
+            await asyncio.gather(*tts_tasks, return_exceptions=True)
+
     try:
         # 先告知浏览器本段回复第一个音频块的 sid，即使音频块乱序到达也能按序播放
         await ws.send_text(json.dumps({"type": "reply_start", "first_sid": state.sid + 1}))
@@ -476,16 +595,22 @@ async def _produce(ws: WebSocket, session: InterviewSession, text: str) -> None:
         if session.messages and session.messages[-1].get("role") == "assistant":
             session.display_history.append(["assistant", session.messages[-1]["content"]])
         await ws.send_text(json.dumps({"type": "done"}))
+        logger.info(
+            "回复生成完成 epoch=%s 耗时=%.1fs 音频段=%s",
+            ws.epoch,
+            time.monotonic() - started,
+            _next_slot[0],
+        )
+    except _StaleReply:
+        logger.info("回复生成已被新回复取代，丢弃剩余帧 epoch=%s", ws.epoch)
     except asyncio.CancelledError:
-        for t in tts_tasks:
-            t.cancel()
-        logger.info("回复生成被用户打断")
+        await _drain_tts_tasks()
+        logger.info("回复生成被用户打断 epoch=%s", ws.epoch)
         with suppress(Exception):
             await ws.send_text(json.dumps({"type": "cancelled"}))
     except Exception:
-        for t in tts_tasks:
-            t.cancel()
-        logger.exception("回复生成失败")
+        await _drain_tts_tasks()
+        logger.exception("回复生成失败 epoch=%s", ws.epoch)
         # 不向前端泄漏内部异常细节，只发结构化错误码 + 友好文案
         with suppress(Exception):
             await ws.send_text(
@@ -498,16 +623,26 @@ async def _produce(ws: WebSocket, session: InterviewSession, text: str) -> None:
                     ensure_ascii=False,
                 )
             )
+    finally:
+        # 关闭 LLM 生成器：cancel 无法中断阻塞在线程里的 next(gen)，若不显式
+        # 关闭，底层 HTTP 流会一直挂着继续产 token（打断后仍在烧钱）
+        with suppress(Exception):
+            gen.close()
 
 
-async def _produce_greeting(ws: WebSocket, greeting: str) -> None:
-    """接通后先播报开场白，像真实通话一样不等用户开口。可被 barge-in 取消。"""
+async def _produce_greeting(ws: _GuardedSender, state: tts.TtsState, greeting: str) -> None:
+    """接通后先播报开场白，像真实通话一样不等用户开口。可被 barge-in 取消。
+
+    任何异常都必须给前端一个终态帧（error/done）：此前非取消异常会让任务
+    静默死亡，前端永远收不到消息、卡在"正在接通"（没有开场白也无从打断）。
+    """
     sentences, rest = tts.split_sentences(greeting)
     if rest.strip():
         sentences.append(rest.strip())
-    state = tts.TtsState()
+    state.ok = True
+    state.voice = ""
     try:
-        await ws.send_text(json.dumps({"type": "reply_start", "first_sid": 1}))
+        await ws.send_text(json.dumps({"type": "reply_start", "first_sid": state.sid + 1}))
         # 文本逐句展示；语音整段一次合成：同一句开场白只有一个音色，
         # 不会出现"前一句 CosyVoice、后一句 edge-tts"的两种声音
         for s in sentences:
@@ -517,7 +652,23 @@ async def _produce_greeting(ws: WebSocket, greeting: str) -> None:
         unit = await tts.synth(state, greeting.strip())
         await tts.push(ws, state, unit)
         await ws.send_text(json.dumps({"type": "done"}))
+        logger.info("开场白播报完成 epoch=%s", ws.epoch)
+    except _StaleReply:
+        logger.info("开场白已被新回复取代 epoch=%s", ws.epoch)
     except asyncio.CancelledError:
-        logger.info("开场白被用户打断")
+        logger.info("开场白被用户打断 epoch=%s", ws.epoch)
         with suppress(Exception):
             await ws.send_text(json.dumps({"type": "cancelled"}))
+    except Exception:
+        logger.exception("开场白生成失败 epoch=%s", ws.epoch)
+        with suppress(Exception):
+            await ws.send_text(
+                json.dumps(
+                    {
+                        "type": "error",
+                        "code": "internal",
+                        "message": "开场白播报失败，你可以直接开口或输入文字开始对话",
+                    },
+                    ensure_ascii=False,
+                )
+            )

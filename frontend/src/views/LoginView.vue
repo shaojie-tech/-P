@@ -71,6 +71,19 @@
       </el-tabs>
 
       <p class="login-tip">登录后，你的面试记录与收藏将按账号保存，跨设备同步。</p>
+
+      <!-- APK 版：后端不与页面同源，服务器地址必须可配置（Web 版走同源，不显示） -->
+      <div v-if="showServerField" class="server-field">
+        <el-form-item label="服务器地址">
+          <el-input
+            v-model="serverBase"
+            placeholder="https://your-server.com"
+            clearable
+            @change="onServerChange"
+          />
+        </el-form-item>
+        <p class="login-tip">修改后立即生效；留空使用内置默认地址。</p>
+      </div>
     </div>
   </div>
 </template>
@@ -80,6 +93,7 @@ import { reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { Lock, User } from '@element-plus/icons-vue'
+import { getServerBase, isNativeApp, setServerBase } from '../api/server'
 import { useAuthStore } from '../stores/auth'
 
 const auth = useAuthStore()
@@ -89,6 +103,14 @@ const route = useRoute()
 const tab = ref('login')
 const loading = ref(false)
 const form = reactive({ username: '', password: '', nickname: '' })
+const showServerField = isNativeApp()
+const serverBase = ref(getServerBase())
+
+function onServerChange(v) {
+  setServerBase(v)
+  serverBase.value = getServerBase()
+  ElMessage.success('服务器地址已保存')
+}
 
 function onAvatarError(e) {
   e.target.src = '' // 回退为空，由 CSS 兜底
@@ -166,5 +188,13 @@ async function onSubmit() {
   font-size: 12px;
   color: var(--muted);
   text-align: center;
+}
+.server-field {
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px dashed var(--border);
+}
+.server-field .login-tip {
+  margin-top: 4px;
 }
 </style>

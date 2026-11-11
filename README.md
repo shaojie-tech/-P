@@ -117,7 +117,7 @@ ruff check .       # 静态检查
 
 ## 🤝 贡献指南
 
-欢迎提交 Issue 与 PR。开发约定请先读 [AGENTS.md](AGENTS.md)；提交规范 `type(scope): 中文描述`、一个需求一个提交；`pytest` 全量离线通过 + `ruff` 干净后再提交，经 PR 合入 `main`（受保护需通过 CI）。
+欢迎提交 Issue 与 PR。开发约定请先读 [AGENTS.md](AGENTS.md)；提交规范 `type(scope): 中文描述`、一个需求一个提交；`pytest` 全量离线通过 + `ruff` 干净后再提交，经 PR 合入 `main`（受保护需通过 CI）。基于 WorkBuddy 平台的多人协作流程（职责边界 / 任务流转 / 资产库存放清单 / 成员准入）见 [docs/TEAM_COLLABORATION.md](docs/TEAM_COLLABORATION.md)。
 
 ## 📄 License
 

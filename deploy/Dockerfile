@@ -14,7 +14,9 @@ WORKDIR /app
 # 先复制依赖声明与源码，安装后再拷入其余文件（利用 Docker 层缓存）
 COPY pyproject.toml README.md ./
 COPY app ./app
-RUN pip install --no-cache-dir .
+# 可通过 --build-arg PIP_INDEX_URL 覆盖；默认阿里云公网 PyPI 镜像，国内构建更快
+ARG PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
+RUN pip install --no-cache-dir -i ${PIP_INDEX_URL} .
 
 COPY . .
 

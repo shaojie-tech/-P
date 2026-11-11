@@ -1,5 +1,6 @@
 // 后端 API 统一封装。
 import { getToken, http, readSse, safeText, setToken } from './http'
+import { apiUrl, redirectToLogin } from './server'
 
 /**
  * 解析 SSE 接口错误响应的可读文案。
@@ -45,7 +46,7 @@ export const sessionApi = {
 export async function chatStream(message, handlers = {}) {
   let res
   try {
-    res = await fetch('/api/chat', {
+    res = await fetch(apiUrl('/api/chat'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${getToken()}` },
       body: JSON.stringify({ message }),
@@ -61,10 +62,7 @@ export async function chatStream(message, handlers = {}) {
     // 401：与 REST 拦截器一致，清令牌并跳登录（bug #2），携带来源页便于回跳（bug #28）
     if (res.status === 401) {
       setToken('')
-      const p = window.location.pathname
-      if (!p.startsWith('/login')) {
-        window.location.href = `/login?redirect=${encodeURIComponent(p + window.location.search)}`
-      }
+      redirectToLogin()
       return
     }
     handlers.onError?.(await sseErrorText(res))
@@ -103,7 +101,7 @@ export const customApi = {
     return (async () => {
       let res
       try {
-        res = await fetch('/api/custom/generate', {
+        res = await fetch(apiUrl('/api/custom/generate'), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${getToken()}` },
           body: JSON.stringify({ job_title: jobTitle, jd }),
@@ -118,10 +116,7 @@ export const customApi = {
         // 401：与 REST 拦截器一致，清令牌并跳登录（bug #2），携带来源页便于回跳（bug #28）
         if (res.status === 401) {
           setToken('')
-          const p = window.location.pathname
-          if (!p.startsWith('/login')) {
-            window.location.href = `/login?redirect=${encodeURIComponent(p + window.location.search)}`
-          }
+          redirectToLogin()
           return
         }
         handlers.onError?.(await sseErrorText(res))
