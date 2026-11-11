@@ -1,4 +1,5 @@
-import { createRouter, createWebHistory } from 'vue-router'
+import { createRouter, createWebHashHistory, createWebHistory } from 'vue-router'
+import { isNativeApp } from '../api/server'
 import { useAuthStore } from '../stores/auth'
 
 const routes = [
@@ -9,7 +10,9 @@ const routes = [
 ]
 
 const router = createRouter({
-  history: createWebHistory(),
+  // 安卓 APK（Capacitor WebView）用 hash 路由：本地资产服务对深层路径的
+  // history 回退不可靠；Web 版保持 history 路由不变
+  history: isNativeApp() ? createWebHashHistory() : createWebHistory(),
   routes,
   scrollBehavior: () => ({ top: 0 }),
 })

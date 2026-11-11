@@ -18,6 +18,7 @@ from pathlib import Path
 
 import uvicorn
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -46,6 +47,16 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(title="面试官小P", lifespan=lifespan)
+
+# CORS：安卓 APK（Capacitor WebView，origin=https://localhost）跨域调用远程后端。
+# 认证走 Bearer 头而非 Cookie，无需 allow_credentials；白名单见 config.CORS_ORIGINS。
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=config.CORS_ORIGINS,
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.middleware("http")

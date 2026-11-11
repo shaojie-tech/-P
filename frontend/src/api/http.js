@@ -1,5 +1,6 @@
 // HTTP 客户端：统一注入 Bearer 令牌，401 自动跳登录；提供 SSE 流式解析工具。
 import axios from 'axios'
+import { getServerBase, redirectToLogin } from './server'
 
 export const TOKEN_KEY = 'xiaop_token'
 
@@ -12,13 +13,15 @@ export function setToken(t) {
 }
 
 export const http = axios.create({
-  baseURL: '',
   // 数组查询参数序列化为 tags=a&tags=b（与 FastAPI list Query 契约匹配）。
   // axios 默认输出 tags[]=a，键名不匹配会导致后端收到 None、筛选被静默忽略。
   paramsSerializer: { indexes: null },
 })
 
 http.interceptors.request.use((cfg) => {
+  // 动态基地址：Web 版为空（同源相对路径），APK 版为配置的服务器地址，
+  // 登录页修改后立即生效，无需重建实例
+  cfg.baseURL = getServerBase()
   const t = getToken()
   if (t) cfg.headers.Authorization = `Bearer ${t}`
   return cfg
@@ -29,11 +32,8 @@ http.interceptors.response.use(
   (err) => {
     if (err.response && err.response.status === 401) {
       setToken('')
-      const p = window.location.pathname
-      if (!p.startsWith('/login')) {
-        // 携带来源页，登录后回到原页面（bug #28，与路由守卫行为一致）
-        window.location.href = `/login?redirect=${encodeURIComponent(p + window.location.search)}`
-      }
+      // 携带来源页，登录后回到原页面（bug #28，与路由守卫行为一致）
+      redirectToLogin()
     }
     return Promise.reject(err)
   },

@@ -12,6 +12,7 @@
 //   上行音频为二进制帧（Int16 LE PCM），控制消息仍为 JSON 文本帧。
 import { onUnmounted, reactive } from 'vue'
 import { authApi, configApi, customApi } from '../../api'
+import { wsUrl } from '../../api/server'
 import { MOCK_START_RE, base64ToBytes, calcRms, echoMatch, normalizeForEcho } from './voiceUtils'
 import workletUrl from './pcm-worklet.js?url'
 
@@ -74,6 +75,7 @@ export function useVoiceCall() {
     micProc: null,
     asrReady: false,
     lastAsrEvent: 0,
+    lastMsgTs: 0, // 最近一次收到服务端消息的时刻（看门狗兜底用）
     vadAvg: 0,
     speakingText: '',
     prevSpeechText: '',
@@ -133,6 +135,14 @@ export function useVoiceCall() {
     const s = Math.max(0, Math.floor((Date.now() - V.timerStart) / 1000))
     const m = Math.floor(s / 60)
     ui.timerText = ('0' + m).slice(-2) + ':' + ('0' + (s % 60)).slice(-2)
+    // 看门狗兜底：等待回复期间服务端连续 15s 无任何消息（回复任务静默死亡/
+    // 链路挂起）→ 恢复到聆听态，避免永久卡在"思考中"且无从打断
+    if (V.phase === PHASE.CONNECTING && V.lastMsgTs && Date.now() - V.lastMsgTs > 15000) {
+      dbg('看门狗：15s 无服务端消息，恢复到聆听态')
+      V.lastMsgTs = Date.now() // 防止每秒重复触发
+      setPhase(PHASE.LISTENING)
+      setStatus('响应超时，请重新开口或挂断重连', true)
+    }
   }
 
   function addBubble(role, text) {
@@ -304,7 +314,12 @@ export function useVoiceCall() {
   function sendText(t) {
     if (!V.ws || V.ws.readyState !== 1) return
     const now = Date.now()
-    if (V.lastSendText === t && now - V.lastSend < 2000) return
+    // 去重窗口收窄到 1s：ASR 可能对同一句话重复回调，但用户短时间重复同一句
+    // （如连说两次"停"）是合法打断，窗口过大（原 2s）会把真打断吞掉
+    if (V.lastSendText === t && now - V.lastSend < 1000) {
+      dbg('去重丢弃 1s 内重复文本: ' + t.slice(0, 12))
+      return
+    }
     V.lastSend = now
     V.lastSendText = t
     dbg('sendText: ' + t.slice(0, 20))
@@ -349,8 +364,19 @@ export function useVoiceCall() {
   }
 
   // ---------- 音频播放队列（按 sid 有序、零间隙） ----------
+  // 后端 sid 连接内全局单调递增：打断后旧回复的迟到帧 sid 必然小于新回复的
+  // first_sid，直接丢弃。这是"两种声音混播/打断后不出声"的第二道防线
+  // （第一道是服务端 epoch 守卫，正常情况下迟到帧根本不会发出）。
+  function isStaleSid(sid) {
+    return V.nextPlaySid > 0 && sid < V.nextPlaySid
+  }
+
   function onAudioStart(sid, text) {
     if (V.suppressAudio) return
+    if (isStaleSid(sid)) {
+      dbg('丢弃迟到音频帧 sid=' + sid + ' < ' + V.nextPlaySid)
+      return
+    }
     V.replyEnded = false
     V.fallbackBySid[sid] = text || ''
     if (V.nextPlaySid === 0) V.nextPlaySid = sid
@@ -366,6 +392,7 @@ export function useVoiceCall() {
 
   function onAudioFrame(sid, b64) {
     if (V.suppressAudio) return
+    if (isStaleSid(sid)) return
     ensureAudio()
     if (!V.audioCtx) return
     const bytes = base64ToBytes(b64)
@@ -377,6 +404,7 @@ export function useVoiceCall() {
   }
 
   function onAudioEnd(sid) {
+    if (isStaleSid(sid)) return
     const bytes = V.sidData[sid]
     delete V.sidData[sid]
     delete V.fallbackBySid[sid]
@@ -616,6 +644,7 @@ export function useVoiceCall() {
     },
     // 该段在线 TTS 失败：跳过并回退浏览器本地语音
     tts_error(m) {
+      if (isStaleSid(m.sid)) return
       V.skippedSids[m.sid] = true
       scheduleReady()
       speakFallback(V.fallbackBySid[m.sid] || '')
@@ -626,8 +655,18 @@ export function useVoiceCall() {
       setTimeout(audioDone, 300)
     },
     cancelled() {
-      if (!V.suppressAudio) return
+      if (V.suppressAudio) {
+        // 前端主动打断（bargeIn/sendText 已停播）：只清理字幕缓冲
+        V.buf = ''
+        setStatus('已打断，请继续')
+        return
+      }
+      // 服务端主动取消（兜底）：清理残留播放状态并恢复聆听，
+      // 否则界面停留在"正在合成语音"且无从打断
+      dbg('收到服务端 cancelled（前端未打断）')
+      stopAudio()
       V.buf = ''
+      setPhase(PHASE.LISTENING)
       setStatus('已打断，请继续')
     },
     asr_ready() {
@@ -667,11 +706,17 @@ export function useVoiceCall() {
         setStatus('请求过于频繁，请稍候…', true)
       } else {
         setStatus('小P出错了: ' + (m.message || '未知错误'), true)
+        // 兜底：回复生成失败时不能停留在"思考中"（不可打断），恢复聆听态
+        if (V.phase === PHASE.CONNECTING) {
+          stopAudio()
+          setPhase(PHASE.LISTENING)
+        }
       }
     },
   }
 
   function onMessage(ev) {
+    V.lastMsgTs = Date.now() // 看门狗：任何服务端消息都算链路存活
     let m
     try {
       m = JSON.parse(ev.data)
@@ -718,9 +763,8 @@ export function useVoiceCall() {
     } catch (e) {
       /* 忽略 */
     }
-    const proto = window.location.protocol === 'https:' ? 'wss://' : 'ws://'
-    const url =
-      proto + window.location.host + '/ws/voice?ticket=' + encodeURIComponent(ticket)
+    // 服务器地址派生 WS 地址：Web 版用当前页面 host，APK 版用配置的服务器地址
+    const url = wsUrl('/ws/voice?ticket=' + encodeURIComponent(ticket))
     let ws
     try {
       ws = new WebSocket(url)
@@ -732,6 +776,7 @@ export function useVoiceCall() {
     V.ws = ws
     V.lastSend = 0
     V.lastSendText = ''
+    V.lastMsgTs = Date.now()
     V.timerStart = Date.now()
     if (V.timerInt) clearInterval(V.timerInt)
     V.timerInt = setInterval(updateTimer, 1000)
