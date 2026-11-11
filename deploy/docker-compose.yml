@@ -4,7 +4,7 @@ services:
       context: ..
       dockerfile: Dockerfile
     ports:
-      - "8765:8765"
+      - "${HOST_PORT:-8765}:8765"
     environment:
       DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY}
       DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY}

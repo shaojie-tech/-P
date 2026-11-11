@@ -16,3 +16,8 @@ data/*.lock
 .env
 .idea
 .vscode
+# 构建上下文瘦身：依赖/产物/安卓工程不进镜像（前端 dist 由镜像内 node 阶段重建）
+node_modules
+frontend/android
+frontend/dist
+dist-apk
